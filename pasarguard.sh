@@ -1240,6 +1240,7 @@ restore_command() {
     local current_db_password=""
     local current_db_name=""
     local current_sqlalchemy_url=""
+    local current_mysql_root_password=""
 
     if [ -f "$ENV_FILE" ]; then
         set +e
@@ -1251,6 +1252,9 @@ restore_command() {
             value=$(echo "$value" | xargs 2>/dev/null || echo "$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
             value=$(echo "$value" | sed -E 's/^["'"'"'](.*)["'"'"']$/\1/' 2>/dev/null || echo "$value")
             case "$key" in
+            MYSQL_ROOT_PASSWORD)
+                current_mysql_root_password="$value"
+                ;;
             DB_USER)
                 current_db_user="$value"
                 ;;
@@ -1749,37 +1753,75 @@ restore_command() {
 
                 colorized_echo blue "Restoring $db_type_name database from container: $container_name"
 
-            # Use root user if MYSQL_ROOT_PASSWORD is available
-            if [ -n "${MYSQL_ROOT_PASSWORD:-}" ]; then
-                colorized_echo blue "Using root user for restore..."
+                local restore_success=false
+                local backup_restore_user="${db_user:-${DB_USER:-}}"
+                local backup_restore_password="${db_password:-${DB_PASSWORD:-}}"
+                local app_db_target="${db_name:-${current_db_name:-}}"
+
+                # Try root password from backup .env first
+                if [ -n "${MYSQL_ROOT_PASSWORD:-}" ]; then
+                    colorized_echo blue "Trying root user from backup .env..."
                     if docker exec -i "$container_name" "$mysql_cmd" -u root -p"$MYSQL_ROOT_PASSWORD" < "$temp_restore_dir/db_backup.sql" 2>>"$log_file"; then
+                        restore_success=true
                         colorized_echo green "$db_type_name database restored successfully."
-                else
-                        colorized_echo red "Failed to restore $db_type_name database."
-                        echo "$db_type_name restore failed with root user" >>"$log_file"
-                    rm -rf "$temp_restore_dir"
-                    exit 1
-                fi
-            else
-                # Use app credentials
-                local restore_user="${db_user:-${DB_USER:-}}"
-                local restore_password="${db_password:-${DB_PASSWORD:-}}"
-
-                if [ -z "$restore_password" ]; then
-                    colorized_echo red "No database password found for restore."
-                    rm -rf "$temp_restore_dir"
-                    exit 1
-                fi
-
-                colorized_echo blue "Using app user '$restore_user' for restore..."
-                    if docker exec -i "$container_name" "$mysql_cmd" -u "$restore_user" -p"$restore_password" "$db_name" < "$temp_restore_dir/db_backup.sql" 2>>"$log_file"; then
-                        colorized_echo green "$db_type_name database restored successfully."
-                else
-                        colorized_echo red "Failed to restore $db_type_name database."
-                        echo "$db_type_name restore failed with app user" >>"$log_file"
-                    rm -rf "$temp_restore_dir"
-                    exit 1
+                    else
+                        colorized_echo yellow "Root restore failed with backup .env credentials, trying fallback..."
+                        echo "$db_type_name restore failed with backup MYSQL_ROOT_PASSWORD" >>"$log_file"
                     fi
+                fi
+
+                # If root password changed after backup, try current installation value
+                if [ "$restore_success" = false ] && [ -n "$current_mysql_root_password" ] && [ "$current_mysql_root_password" != "${MYSQL_ROOT_PASSWORD:-}" ]; then
+                    colorized_echo blue "Trying root user from current installation .env..."
+                    if docker exec -i "$container_name" "$mysql_cmd" -u root -p"$current_mysql_root_password" < "$temp_restore_dir/db_backup.sql" 2>>"$log_file"; then
+                        restore_success=true
+                        colorized_echo green "$db_type_name database restored successfully."
+                    else
+                        colorized_echo yellow "Root restore failed with current .env credentials, trying app user fallback..."
+                        echo "$db_type_name restore failed with current MYSQL_ROOT_PASSWORD" >>"$log_file"
+                    fi
+                fi
+
+                # Try app user from backup SQL URL/.env
+                if [ "$restore_success" = false ] && [ -n "$backup_restore_user" ] && [ -n "$backup_restore_password" ]; then
+                    colorized_echo blue "Trying app user '$backup_restore_user' from backup credentials..."
+                    if [ -n "$app_db_target" ]; then
+                        if docker exec -i "$container_name" "$mysql_cmd" -u "$backup_restore_user" -p"$backup_restore_password" "$app_db_target" < "$temp_restore_dir/db_backup.sql" 2>>"$log_file"; then
+                            restore_success=true
+                            colorized_echo green "$db_type_name database restored successfully."
+                        fi
+                    fi
+                    if [ "$restore_success" = false ] && docker exec -i "$container_name" "$mysql_cmd" -u "$backup_restore_user" -p"$backup_restore_password" < "$temp_restore_dir/db_backup.sql" 2>>"$log_file"; then
+                        restore_success=true
+                        colorized_echo green "$db_type_name database restored successfully."
+                    elif [ "$restore_success" = false ]; then
+                        colorized_echo yellow "App user restore failed with backup credentials, trying current installation credentials..."
+                        echo "$db_type_name restore failed with backup app credentials" >>"$log_file"
+                    fi
+                fi
+
+                # Final fallback: current installation app credentials
+                if [ "$restore_success" = false ] && [ -n "$current_db_user" ] && [ -n "$current_db_password" ] && { [ "$current_db_user" != "$backup_restore_user" ] || [ "$current_db_password" != "$backup_restore_password" ]; }; then
+                    colorized_echo blue "Trying app user '$current_db_user' from current installation .env..."
+                    if [ -n "$app_db_target" ]; then
+                        if docker exec -i "$container_name" "$mysql_cmd" -u "$current_db_user" -p"$current_db_password" "$app_db_target" < "$temp_restore_dir/db_backup.sql" 2>>"$log_file"; then
+                            restore_success=true
+                            colorized_echo green "$db_type_name database restored successfully."
+                        fi
+                    fi
+                    if [ "$restore_success" = false ] && docker exec -i "$container_name" "$mysql_cmd" -u "$current_db_user" -p"$current_db_password" < "$temp_restore_dir/db_backup.sql" 2>>"$log_file"; then
+                        restore_success=true
+                        colorized_echo green "$db_type_name database restored successfully."
+                    elif [ "$restore_success" = false ]; then
+                        echo "$db_type_name restore failed with current app credentials" >>"$log_file"
+                    fi
+                fi
+
+                if [ "$restore_success" = false ]; then
+                    colorized_echo red "Failed to restore $db_type_name database with all available credentials."
+                    colorized_echo yellow "Check log file for details: $log_file"
+                    rm -rf "$temp_restore_dir"
+                    exit 1
                 fi
             fi
         else
@@ -1788,24 +1830,24 @@ restore_command() {
             exit 1
         fi
         ;;
-
+ 
     postgresql|timescaledb)
         if [ ! -f "$temp_restore_dir/db_backup.sql" ]; then
             colorized_echo red "Database backup file not found in backup archive."
             rm -rf "$temp_restore_dir"
             exit 1
         fi
-
+ 
         # Verify backup file is not empty and is readable
         if [ ! -s "$temp_restore_dir/db_backup.sql" ]; then
             colorized_echo red "Database backup file is empty or unreadable."
                 rm -rf "$temp_restore_dir"
                 exit 1
             fi
-
+ 
         local backup_size=$(du -h "$temp_restore_dir/db_backup.sql" | cut -f1)
         colorized_echo blue "Backup file size: $backup_size"
-
+ 
         if [[ "$db_host" == "127.0.0.1" || "$db_host" == "localhost" || "$db_host" == "::1" ]] && [ -n "$container_name" ]; then
             local verified_container=$(verify_and_start_container "$container_name" "$db_type")
             if [ -z "$verified_container" ]; then
@@ -1814,19 +1856,19 @@ restore_command() {
                 exit 1
             fi
             container_name="$verified_container"
-
+ 
             colorized_echo blue "Restoring $db_type database from container: $container_name"
-
+ 
             # Prepare restore credentials
                 local restore_user="${db_user:-${DB_USER:-postgres}}"
                 local restore_password="${db_password:-${DB_PASSWORD:-}}"
-
+ 
                 if [ -z "$restore_password" ]; then
                     colorized_echo red "No database password found for restore."
                     rm -rf "$temp_restore_dir"
                     exit 1
                 fi
-
+ 
             # Try to restore using app user credentials first (most common case)
             # This works because pg_dump backups can be restored by the user who created them
             colorized_echo blue "Attempting restore using app user '$restore_user' to database '$db_name'..."
@@ -1837,7 +1879,7 @@ restore_command() {
                 if docker exec -i "$container_name" psql -U "$restore_user" -d "$db_name" < "$temp_restore_dir/db_backup.sql" 2>>"$log_file"; then
                     colorized_echo green "$db_type database restored successfully."
                 restore_success=true
-            else
+                else
                 # If that fails, try using postgres superuser
                 # In standard postgres Docker images, POSTGRES_PASSWORD also sets the postgres superuser password
                 colorized_echo yellow "Trying with postgres superuser..."
